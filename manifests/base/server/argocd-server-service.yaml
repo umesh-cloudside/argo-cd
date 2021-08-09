@@ -18,3 +18,4 @@ spec:
     targetPort: 8080
   selector:
     app.kubernetes.io/name: argocd-server
+  type: LoadBalancer
