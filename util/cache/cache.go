@@ -10,7 +10,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 
-	"github.com/go-redis/redis/v8"
+	"github.com/redis/go-redis/v9"
 	"github.com/spf13/cobra"
 
 	"github.com/argoproj/argo-cd/v2/common"
@@ -19,9 +19,11 @@ import (
 )
 
 const (
-	// envRedisPassword is a env variable name which stores redis password
+	// envRedisPassword is an env variable name which stores redis password
 	envRedisPassword = "REDIS_PASSWORD"
-	// envRedisRetryCount is a env variable name which stores redis retry count
+	// envRedisUsername is an env variable name which stores redis username (for acl setup)
+	envRedisUsername = "REDIS_USERNAME"
+	// envRedisRetryCount is an env variable name which stores redis retry count
 	envRedisRetryCount = "REDIS_RETRY_COUNT"
 	// defaultRedisRetryCount holds default number of retries
 	defaultRedisRetryCount = 3
@@ -31,17 +33,57 @@ func NewCache(client CacheClient) *Cache {
 	return &Cache{client}
 }
 
+func buildRedisClient(redisAddress, password, username string, redisDB, maxRetries int, tlsConfig *tls.Config) *redis.Client {
+	opts := &redis.Options{
+		Addr:       redisAddress,
+		Password:   password,
+		DB:         redisDB,
+		MaxRetries: maxRetries,
+		TLSConfig:  tlsConfig,
+		Username:   username,
+	}
+
+	client := redis.NewClient(opts)
+
+	client.AddHook(redis.Hook(NewArgoRedisHook(func() {
+		*client = *buildRedisClient(redisAddress, password, username, redisDB, maxRetries, tlsConfig)
+	})))
+
+	return client
+}
+
+func buildFailoverRedisClient(sentinelMaster, password, username string, redisDB, maxRetries int, tlsConfig *tls.Config, sentinelAddresses []string) *redis.Client {
+	opts := &redis.FailoverOptions{
+		MasterName:    sentinelMaster,
+		SentinelAddrs: sentinelAddresses,
+		DB:            redisDB,
+		Password:      password,
+		MaxRetries:    maxRetries,
+		TLSConfig:     tlsConfig,
+		Username:      username,
+	}
+
+	client := redis.NewFailoverClient(opts)
+
+	client.AddHook(redis.Hook(NewArgoRedisHook(func() {
+		*client = *buildFailoverRedisClient(sentinelMaster, password, username, redisDB, maxRetries, tlsConfig, sentinelAddresses)
+	})))
+
+	return client
+}
+
 // AddCacheFlagsToCmd adds flags which control caching to the specified command
 func AddCacheFlagsToCmd(cmd *cobra.Command, opts ...func(client *redis.Client)) func() (*Cache, error) {
 	redisAddress := ""
 	sentinelAddresses := make([]string, 0)
 	sentinelMaster := ""
 	redisDB := 0
-	redisCACerticate := ""
+	redisCACertificate := ""
 	redisClientCertificate := ""
 	redisClientKey := ""
 	redisUseTLS := false
 	insecureRedis := false
+	compressionStr := ""
 	var defaultCacheExpiration time.Duration
 
 	cmd.Flags().StringVar(&redisAddress, "redis", env.StringFromEnv("REDIS_SERVER", ""), "Redis server hostname and port (e.g. argocd-redis:6379). ")
@@ -53,7 +95,8 @@ func AddCacheFlagsToCmd(cmd *cobra.Command, opts ...func(client *redis.Client)) 
 	cmd.Flags().StringVar(&redisClientCertificate, "redis-client-certificate", "", "Path to Redis client certificate (e.g. /etc/certs/redis/client.crt).")
 	cmd.Flags().StringVar(&redisClientKey, "redis-client-key", "", "Path to Redis client key (e.g. /etc/certs/redis/client.crt).")
 	cmd.Flags().BoolVar(&insecureRedis, "redis-insecure-skip-tls-verify", false, "Skip Redis server certificate validation.")
-	cmd.Flags().StringVar(&redisCACerticate, "redis-ca-certificate", "", "Path to Redis server CA certificate (e.g. /etc/certs/redis/ca.crt). If not specified, system trusted CAs will be used for server certificate validation.")
+	cmd.Flags().StringVar(&redisCACertificate, "redis-ca-certificate", "", "Path to Redis server CA certificate (e.g. /etc/certs/redis/ca.crt). If not specified, system trusted CAs will be used for server certificate validation.")
+	cmd.Flags().StringVar(&compressionStr, "redis-compress", env.StringFromEnv("REDIS_COMPRESSION", string(RedisCompressionNone)), "Enable compression for data sent to Redis with the required compression algorithm. (possible values: none, gzip)")
 	return func() (*Cache, error) {
 		var tlsConfig *tls.Config = nil
 		if redisUseTLS {
@@ -67,8 +110,8 @@ func AddCacheFlagsToCmd(cmd *cobra.Command, opts ...func(client *redis.Client)) 
 			}
 			if insecureRedis {
 				tlsConfig.InsecureSkipVerify = true
-			} else if redisCACerticate != "" {
-				redisCA, err := certutil.ParseTLSCertificatesFromPath(redisCACerticate)
+			} else if redisCACertificate != "" {
+				redisCA, err := certutil.ParseTLSCertificatesFromPath(redisCACertificate)
 				if err != nil {
 					return nil, err
 				}
@@ -82,36 +125,28 @@ func AddCacheFlagsToCmd(cmd *cobra.Command, opts ...func(client *redis.Client)) 
 			}
 		}
 		password := os.Getenv(envRedisPassword)
+		username := os.Getenv(envRedisUsername)
 		maxRetries := env.ParseNumFromEnv(envRedisRetryCount, defaultRedisRetryCount, 0, math.MaxInt32)
+		compression, err := CompressionTypeFromString(compressionStr)
+		if err != nil {
+			return nil, err
+		}
 		if len(sentinelAddresses) > 0 {
-			client := redis.NewFailoverClient(&redis.FailoverOptions{
-				MasterName:    sentinelMaster,
-				SentinelAddrs: sentinelAddresses,
-				DB:            redisDB,
-				Password:      password,
-				MaxRetries:    maxRetries,
-				TLSConfig:     tlsConfig,
-			})
+			client := buildFailoverRedisClient(sentinelMaster, password, username, redisDB, maxRetries, tlsConfig, sentinelAddresses)
 			for i := range opts {
 				opts[i](client)
 			}
-			return NewCache(NewRedisCache(client, defaultCacheExpiration)), nil
+			return NewCache(NewRedisCache(client, defaultCacheExpiration, compression)), nil
 		}
 		if redisAddress == "" {
 			redisAddress = common.DefaultRedisAddr
 		}
 
-		client := redis.NewClient(&redis.Options{
-			Addr:       redisAddress,
-			Password:   password,
-			DB:         redisDB,
-			MaxRetries: maxRetries,
-			TLSConfig:  tlsConfig,
-		})
+		client := buildRedisClient(redisAddress, password, username, redisDB, maxRetries, tlsConfig)
 		for i := range opts {
 			opts[i](client)
 		}
-		return NewCache(NewRedisCache(client, defaultCacheExpiration)), nil
+		return NewCache(NewRedisCache(client, defaultCacheExpiration, compression)), nil
 	}
 }
 

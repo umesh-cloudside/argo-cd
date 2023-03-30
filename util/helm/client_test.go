@@ -2,8 +2,15 @@ package helm
 
 import (
 	"bytes"
+	"encoding/json"
+	"fmt"
 	"os"
+	"strings"
 	"testing"
+
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -65,7 +72,7 @@ func TestIndex(t *testing.T) {
 
 func Test_nativeHelmChart_ExtractChart(t *testing.T) {
 	client := NewClient("https://argoproj.github.io/argo-helm", Creds{}, false, "")
-	path, closer, err := client.ExtractChart("argo-cd", "0.7.1")
+	path, closer, err := client.ExtractChart("argo-cd", "0.7.1", false)
 	assert.NoError(t, err)
 	defer io.Close(closer)
 	info, err := os.Stat(path)
@@ -75,7 +82,7 @@ func Test_nativeHelmChart_ExtractChart(t *testing.T) {
 
 func Test_nativeHelmChart_ExtractChart_insecure(t *testing.T) {
 	client := NewClient("https://argoproj.github.io/argo-helm", Creds{InsecureSkipVerify: true}, false, "")
-	path, closer, err := client.ExtractChart("argo-cd", "0.7.1")
+	path, closer, err := client.ExtractChart("argo-cd", "0.7.1", false)
 	assert.NoError(t, err)
 	defer io.Close(closer)
 	info, err := os.Stat(path)
@@ -119,4 +126,109 @@ func TestIsHelmOciRepo(t *testing.T) {
 	assert.True(t, IsHelmOciRepo("demo.goharbor.io:8080"))
 	assert.False(t, IsHelmOciRepo("https://demo.goharbor.io"))
 	assert.False(t, IsHelmOciRepo("https://demo.goharbor.io:8080"))
+}
+
+func TestGetIndexURL(t *testing.T) {
+	urlTemplate := `https://gitlab.com/projects/%s/packages/helm/stable`
+	t.Run("URL without escaped characters", func(t *testing.T) {
+		rawURL := fmt.Sprintf(urlTemplate, "232323982")
+		want := rawURL + "/index.yaml"
+		got, err := getIndexURL(rawURL)
+		assert.Equal(t, want, got)
+		assert.NoError(t, err)
+	})
+	t.Run("URL with escaped characters", func(t *testing.T) {
+		rawURL := fmt.Sprintf(urlTemplate, "mygroup%2Fmyproject")
+		want := rawURL + "/index.yaml"
+		got, err := getIndexURL(rawURL)
+		assert.Equal(t, want, got)
+		assert.NoError(t, err)
+	})
+	t.Run("URL with invalid escaped characters", func(t *testing.T) {
+		rawURL := fmt.Sprintf(urlTemplate, "mygroup%**myproject")
+		got, err := getIndexURL(rawURL)
+		assert.Equal(t, "", got)
+		assert.Error(t, err)
+	})
+}
+
+func TestGetTagsFromUrl(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		responseTags := TagsList{}
+		w.Header().Set("Content-Type", "application/json")
+		if !strings.Contains(r.URL.String(), "token") {
+			w.Header().Set("Link", fmt.Sprintf("<https://%s%s?token=next-token>; rel=next", r.Host, r.URL.Path))
+			responseTags.Tags = []string{"first"}
+		} else {
+			responseTags.Tags = []string{"second"}
+		}
+		w.WriteHeader(http.StatusOK)
+		err := json.NewEncoder(w).Encode(responseTags)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}))
+
+	client := NewClient(server.URL, Creds{InsecureSkipVerify: true}, true, "")
+
+	tags, err := client.GetTags("mychart", true)
+	assert.NoError(t, err)
+	assert.Equal(t, tags.Tags[0], "first")
+	assert.Equal(t, tags.Tags[1], "second")
+}
+
+func Test_getNextUrl(t *testing.T) {
+	baseUrl, err := url.Parse("https://my.repo.com/v2/chart/tags/list")
+	if err != nil {
+		t.Errorf("failed to parse url in test case: %v", err)
+	}
+	resp := &http.Response{
+		Request: &http.Request{
+			URL: baseUrl,
+		},
+	}
+	nextUrl, err := getNextUrl(resp)
+	assert.Equal(t, nextUrl, "")
+	assert.NoError(t, err)
+
+	var nextUrlAbsolute = "https://my.repo.com/v2/chart/tags/list?n=123&orderby="
+	resp.Header = http.Header{
+		"Link": []string{fmt.Sprintf(`<%s>; rel="next"`, nextUrlAbsolute)},
+	}
+	nextUrl, err = getNextUrl(resp)
+	assert.NoError(t, err)
+	assert.Equal(t, nextUrl, nextUrlAbsolute)
+
+	var nextUrlRelative = "/v2/chart/tags/list?n=123&orderby="
+	resp.Header = http.Header{
+		"Link": []string{fmt.Sprintf(`<%s>; rel="next"`, nextUrlRelative)},
+	}
+	nextUrl, err = getNextUrl(resp)
+	assert.NoError(t, err)
+	assert.Equal(t, nextUrl, "https://my.repo.com/v2/chart/tags/list?n=123&orderby=")
+}
+
+func Test_getTagsListURL(t *testing.T) {
+	tagsListURL, err := getTagsListURL("account.dkr.ecr.eu-central-1.amazonaws.com", "dss")
+	assert.Nil(t, err)
+	assert.Equal(t, tagsListURL, "https://account.dkr.ecr.eu-central-1.amazonaws.com/v2/dss/tags/list")
+
+	tagsListURL, err = getTagsListURL("http://account.dkr.ecr.eu-central-1.amazonaws.com", "dss")
+	assert.Nil(t, err)
+	assert.Equal(t, tagsListURL, "https://account.dkr.ecr.eu-central-1.amazonaws.com/v2/dss/tags/list")
+
+	// with trailing /
+	tagsListURL, err = getTagsListURL("https://account.dkr.ecr.eu-central-1.amazonaws.com/", "dss")
+	assert.Nil(t, err)
+	assert.Equal(t, tagsListURL, "https://account.dkr.ecr.eu-central-1.amazonaws.com/v2/dss/tags/list")
+
+	// with unescaped characters allowed by https://www.rfc-editor.org/rfc/rfc3986#page-50
+	tagsListURL, err = getTagsListURL("https://account.dkr.ecr.eu-central-1.amazonaws.com/", "charts.-_~$&+=:@dss")
+	assert.Nil(t, err)
+	assert.Equal(t, tagsListURL, "https://account.dkr.ecr.eu-central-1.amazonaws.com/v2/charts.-_~$&+=:@dss/tags/list")
+
+	// with escaped characters not allowed in path by https://www.rfc-editor.org/rfc/rfc3986#page-50
+	tagsListURL, err = getTagsListURL("https://account.dkr.ecr.eu-central-1.amazonaws.com/", "charts%/dss")
+	assert.Nil(t, err)
+	assert.Equal(t, tagsListURL, "https://account.dkr.ecr.eu-central-1.amazonaws.com/v2/charts%25%2Fdss/tags/list")
 }

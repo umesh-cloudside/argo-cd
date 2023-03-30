@@ -1,5 +1,30 @@
 # Helm
 
+## Declarative
+
+You can install Helm charts through the UI, or in the declarative GitOps way.  
+Helm is [only used to inflate charts with `helm template`](../../faq#after-deploying-my-helm-application-with-argo-cd-i-cannot-see-it-with-helm-ls-and-other-helm-commands). The lifecycle of the application is handled by Argo CD instead of Helm.
+Here is an example:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: sealed-secrets
+  namespace: argocd
+spec:
+  project: default
+  source:
+    chart: sealed-secrets
+    repoURL: https://bitnami-labs.github.io/sealed-secrets
+    targetRevision: 1.16.1
+    helm:
+      releaseName: sealed-secrets
+  destination:
+    server: "https://kubernetes.default.svc"
+    namespace: kubeseal
+```
+
 ## Values Files
 
 Helm has the ability to use a different, or even multiple "values.yaml" files to derive its
@@ -10,9 +35,20 @@ flag. The flag can be repeated to support multiple values files:
 argocd app set helm-guestbook --values values-production.yaml
 ```
 !!! note
-    Values files must be in the same git repository as the Helm chart. The files can be in a different 
-    location in which case it can be accessed using a relative path relative to the root directory of 
-    the Helm chart.
+    Before `v2.6` of Argo CD, Values files must be in the same git repository as the Helm
+    chart. The files can be in a different location in which case it can be accessed using
+    a relative path relative to the root directory of the Helm chart.
+    As of `v2.6`, values files can be sourced from a separate repository than the Helm chart
+    by taking advantage of [multiple sources for Applications](./multiple_sources.md#helm-value-files-from-external-git-repository).
+
+In the declarative syntax:
+
+```yaml
+source:
+  helm:
+    valueFiles:
+    - values-production.yaml
+```
 
 ## Helm Parameters
 
@@ -23,11 +59,21 @@ a `values.yaml`. For example, `service.type` is a common parameter which is expo
 helm template . --set service.type=LoadBalancer
 ```
 
-Similarly, Argo CD can override values in the `values.yaml` parameters using `argo app set` command,
+Similarly, Argo CD can override values in the `values.yaml` parameters using `argocd app set` command,
 in the form of `-p PARAM=VALUE`. For example:
 
 ```bash
 argocd app set helm-guestbook -p service.type=LoadBalancer
+```
+
+In the declarative syntax:
+
+```yaml
+source:
+  helm:
+    parameters:
+    - name: "service.type"
+      value: LoadBalancer
 ```
 
 ## Helm Release Name
@@ -51,8 +97,6 @@ source:
     Please note that overriding the Helm release name might cause problems when the chart you are deploying is using the `app.kubernetes.io/instance` label. ArgoCD injects this label with the value of the Application name for tracking purposes. So when overriding the release name, the Application name will stop being equal to the release name. Because ArgoCD will overwrite the label with the Application name it might cause some selectors on the resources to stop working. In order to avoid this we can configure ArgoCD to use another label for tracking in the [ArgoCD configmap argocd-cm.yaml](../operator-manual/argocd-cm.yaml) - check the lines describing `application.instanceLabelKey`.
 
 ## Helm Hooks
-
-> v1.3 or later
 
 Helm hooks are similar to [Argo CD hooks](resource_hooks.md). In Helm, a hook
 is any normal Kubernetes resource annotated with the `helm.sh/hook` annotation.
@@ -88,7 +132,7 @@ Unsupported hooks are ignored. In Argo CD, hooks are created by using `kubectl a
 * Annotate  `pre-install` and `post-install` with `hook-weight: "-1"`. This will make sure it runs to success before any upgrade hooks.
 * Annotate `pre-upgrade` and `post-upgrade` with `hook-delete-policy: before-hook-creation` to make sure it runs on every sync.
 
-Read more about [Argo hooks](resource_hooks.md) and [Helm hooks](https://github.com/helm/helm/blob/dev-v2/docs/charts_hooks.md).
+Read more about [Argo hooks](resource_hooks.md) and [Helm hooks](https://helm.sh/docs/topics/charts_hooks/).
 
 ## Random Data
 
@@ -110,15 +154,14 @@ The Argo CD application controller periodically compares Git state against the l
 the `helm template <CHART>` command to generate the helm manifests. Because the random value is
 regenerated every time the comparison is made, any application which makes use of the `randAlphaNum`
 function will always be in an `OutOfSync` state. This can be mitigated by explicitly setting a
-value, in the values.yaml such that the value is stable between each comparison. For example:
+value in the values.yaml or using `argocd app set` command to overide the value such that the value
+is stable between each comparison. For example:
 
 ```bash
 argocd app set redis -p password=abc123
 ```
 
 ## Build Environment
-
-> v1.4
 
 Helm apps have access to the [standard build environment](build-environment.md) via substitution as parameters.
 
@@ -140,15 +183,26 @@ Or via declarative syntax:
           value: $ARGOCD_APP_NAME
 ```
 
-## Helm plugins
+It's also possible to use build environment variables for the Helm values file path:
 
-> v1.5
+```yaml
+  spec:
+    source:
+      helm:
+        valueFiles:
+        - values.yaml
+        - myprotocol://somepath/$ARGOCD_APP_NAME/$ARGOCD_APP_REVISION
+```
+
+## Helm plugins
 
 Argo CD is un-opinionated on what cloud provider you use and what kind of Helm plugins you are using, that's why there are no plugins delivered with the ArgoCD image.
 
-But sometimes it happens you would like to use a custom plugin. One of the cases is that you would like to use Google Cloud Storage or Amazon S3 storage to save the Helm charts, for example: https://github.com/hayorov/helm-gcs where you can use `gs://` protocol for Helm chart repository access.
+But sometimes you want to use a custom plugin. Perhaps you would like to use Google Cloud Storage or Amazon S3 storage to save the Helm charts, for example: https://github.com/hayorov/helm-gcs where you can use `gs://` protocol for Helm chart repository access.
+There are two ways to install custom plugins; you can modify the ArgoCD container image, or you can use a Kubernetes `initContainer`.
 
-In order to do that you have to prepare your own ArgoCD image with installed plugins.
+### Modifying the ArgoCD container image
+One way to use this plugin is to prepare your own ArgoCD image where it is included.
 
 Example `Dockerfile`:
 
@@ -176,6 +230,51 @@ You have to remember about `HELM_PLUGINS` environment property - this is require
 
 After that you have to use your custom image for ArgoCD installation.
 
+### Using `initContainers`
+Another option is to install Helm plugins via Kubernetes `initContainers`.
+Some users find this pattern preferable to maintaining their own version of the ArgoCD container image.
+
+Below is an example of how to add Helm plugins when installing ArgoCD with the [official ArgoCD helm chart](https://github.com/argoproj/argo-helm/tree/master/charts/argo-cd):
+
+```
+repoServer:
+  volumes:
+    - name: gcp-credentials
+      secret:
+        secretName: my-gcp-credentials
+  volumeMounts:
+    - name: gcp-credentials
+      mountPath: /gcp
+  env:
+    - name: HELM_CACHE_HOME
+      value: /helm-working-dir
+    - name: HELM_CONFIG_HOME
+      value: /helm-working-dir
+    - name: HELM_DATA_HOME
+      value: /helm-working-dir
+  initContainers:
+    - name: helm-gcp-authentication
+      image: alpine/helm:3.8.1
+      volumeMounts:
+        - name: helm-working-dir
+          mountPath: /helm-working-dir
+        - name: gcp-credentials
+          mountPath: /gcp
+      env:
+        - name: HELM_CACHE_HOME
+          value: /helm-working-dir
+        - name: HELM_CONFIG_HOME
+          value: /helm-working-dir
+        - name: HELM_DATA_HOME
+          value: /helm-working-dir
+      command: [ "/bin/sh", "-c" ]
+      args:
+        - apk --no-cache add curl;
+          helm plugin install https://github.com/hayorov/helm-gcs.git;
+          helm repo add my-gcs-repo gs://my-private-helm-gcs-repository;
+          chmod -R 777 $HELM_DATA_HOME;
+```
+
 ## Helm Version
 
 Argo CD will assume that the Helm chart is v3 (even if the apiVersion field in the chart is Helm v2), unless v2 is explicitly specified within the Argo CD Application (see below).
@@ -193,4 +292,45 @@ spec:
   source:
     helm:
       version: v3
+```
+
+## Helm `--pass-credentials`
+
+Helm, [starting with v3.6.1](https://github.com/helm/helm/releases/tag/v3.6.1),
+prevents sending repository credentials to download charts that are being served
+from a different domain than the repository.
+
+If needed, it is possible to opt into passing credentials for all domains by setting the `helm-pass-credentials` flag on the cli:
+
+```bash
+argocd app set helm-guestbook --helm-pass-credentials
+```
+
+Or using declarative syntax:
+
+```yaml
+spec:
+  source:
+    helm:
+      passCredentials: true
+```
+
+## Helm `--skip-crds`
+
+Helm installs custom resource definitions in the `crds` folder by default if they are not existing. 
+See the [CRD best practices](https://helm.sh/docs/chart_best_practices/custom_resource_definitions/) for details.
+
+If needed, it is possible to skip the CRD installation step with the `helm-skip-crds` flag on the cli:
+
+```bash
+argocd app set helm-guestbook --helm-skip-crds
+```
+
+Or using declarative syntax:
+
+```yaml
+spec:
+  source:
+    helm:
+      skipCrds: true
 ```

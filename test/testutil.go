@@ -2,12 +2,16 @@ package test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net"
+	"os"
+	"testing"
 	"time"
 
+	"github.com/ghodss/yaml"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/tools/cache"
 )
 
@@ -63,9 +67,43 @@ func portIsOpen(addr string) bool {
 
 // Read the contents of a file and returns it as string. Panics on error.
 func MustLoadFileToString(path string) string {
-	o, err := ioutil.ReadFile(path)
+	o, err := os.ReadFile(path)
 	if err != nil {
 		panic(err.Error())
 	}
 	return string(o)
+}
+
+func YamlToUnstructured(yamlStr string) *unstructured.Unstructured {
+	obj := make(map[string]interface{})
+	err := yaml.Unmarshal([]byte(yamlStr), &obj)
+	if err != nil {
+		panic(err)
+	}
+	return &unstructured.Unstructured{Object: obj}
+}
+
+// ToMap converts any object to a map[string]interface{}
+func ToMap(obj interface{}) map[string]interface{} {
+	data, err := json.Marshal(obj)
+	if err != nil {
+		panic(err)
+	}
+	var res map[string]interface{}
+	err = json.Unmarshal(data, &res)
+	if err != nil {
+		panic(err)
+	}
+	return res
+}
+
+// GetTestDir will return the full directory path of the
+// calling test file.
+func GetTestDir(t *testing.T) string {
+	t.Helper()
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cwd
 }
